@@ -4,6 +4,7 @@ import time
 import numpy as np
 
 import torch
+import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
 import torch.nn.functional as F
@@ -26,7 +27,7 @@ def classifier_warmup(model, train_labeled_set, train_unlabeled_set, N_SAMPLES_P
 
     # Construct dataloaders
     labeled_trainloader = data.DataLoader(train_labeled_set, batch_size=batch_size,
-                                          shuffle=False, num_workers=0, drop_last=False)
+                                          shuffle=True, num_workers=0, drop_last=False)
     unlabeled_trainloader = data.DataLoader(train_unlabeled_set, batch_size=batch_size,
                                             shuffle=False, num_workers=0, drop_last=False)
 
@@ -56,17 +57,25 @@ def classifier_warmup(model, train_labeled_set, train_unlabeled_set, N_SAMPLES_P
     optimizer = optim.Adam(param_list, lr=lr)
 
     # Generate TFE features in advance as the model and the data loaders are fixed anyway
-    balanced_feature_set = TFE(labeled_trainloader, unlabeled_trainloader,
-                               tfe_model, num_class, N_SAMPLES_PER_CLASS)
-    balanced_feature_loader = data.DataLoader(balanced_feature_set, batch_size=batch_size,
-                                              shuffle=True, num_workers=0, drop_last=True)
+    if args.TFE_warmup:
+        print("!!!   USING TFE WARMUP   !!!")
+        balanced_feature_set = TFE(labeled_trainloader, unlabeled_trainloader,
+                                tfe_model, num_class, N_SAMPLES_PER_CLASS)
+        balanced_feature_loader = data.DataLoader(balanced_feature_set, batch_size=batch_size,
+                                                shuffle=True, num_workers=0, drop_last=True)
+        # Main function
+        for epoch in range(epochs):
+            print('\ncRT: Epoch: [%d | %d] LR: %f' % (epoch + 1, epochs, optimizer.param_groups[0]['lr']))
 
-    # Main function
-    for epoch in range(epochs):
-        print('\ncRT: Epoch: [%d | %d] LR: %f' % (epoch + 1, epochs, optimizer.param_groups[0]['lr']))
+            classifier_train(balanced_feature_loader, model,\
+                             optimizer, None, ema_optimizer, val_iteration, use_cuda, only_feats=True)
+    else:
+        print("!!!   NOT USING TFE WARMUP   !!!")
+        for epoch in range(epochs):
+            print('\ncRT: Epoch: [%d | %d] LR: %f' % (epoch + 1, epochs, optimizer.param_groups[0]['lr']))
 
-        classifier_train(balanced_feature_loader, model, optimizer, None, ema_optimizer, val_iteration, use_cuda)
-
+            classifier_train(labeled_trainloader, model, optimizer,\
+                             None, ema_optimizer, val_iteration, use_cuda, only_feats=False)
     return model, ema_model
 
 
@@ -209,7 +218,8 @@ def weight_imprint(model, labeled_set, num_classes):
     return model
 
 
-def classifier_train(labeled_trainloader, model, optimizer, scheduler, ema_optimizer, val_iteration, use_cuda):
+def classifier_train(labeled_trainloader, model, optimizer, scheduler,\
+                     ema_optimizer, val_iteration, use_cuda, only_feats=True):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -218,11 +228,11 @@ def classifier_train(labeled_trainloader, model, optimizer, scheduler, ema_optim
 
     bar = Bar('Training', max=val_iteration)
     labeled_train_iter = iter(labeled_trainloader)
-
+    loss_ce = nn.CrossEntropyLoss(reduction='mean')
     model.eval()
     for batch_idx in range(val_iteration):
         try:
-            inputs_x, targets_x = labeled_train_iter.next()
+            inputs_x, targets_x, _ = labeled_train_iter.next()
         except:
             labeled_train_iter = iter(labeled_trainloader)
             inputs_x, targets_x = labeled_train_iter.next()
@@ -231,12 +241,13 @@ def classifier_train(labeled_trainloader, model, optimizer, scheduler, ema_optim
 
         if use_cuda:
             inputs_x, targets_x = inputs_x.cuda(), targets_x.cuda(non_blocking=True)  # targets are one-hot
-
-        outputs = model.output(inputs_x)
-
-        loss = (-F.log_softmax(outputs, dim=1) * targets_x).sum(dim=1)
-        loss = loss.mean()
-        acc = (torch.argmax(outputs, dim=1) == torch.argmax(targets_x, dim=1)).float().sum() / len(targets_x)
+        if only_feats:
+            outputs = model.output(inputs_x)
+        else:
+            outputs = model(inputs_x)
+        # loss = (-F.log_softmax(outputs[0], dim=1) * targets_x).sum(dim=1)
+        loss = loss_ce(outputs[0], targets_x)
+        acc = (torch.argmax(outputs[0], dim=1) == torch.argmax(targets_x)).float().sum() / len(targets_x)
 
         # Record loss and acc
         losses.update(loss.item(), inputs_x.size(0))

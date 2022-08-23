@@ -20,6 +20,8 @@ import torch.utils.data as data
 from torch.utils.data.sampler import BatchSampler
 import torchvision
 
+from sklearn.metrics import recall_score
+
 import models.wrn as models
 import dataset.fix_cifar10 as dataset_cifar10
 import dataset.fix_cifar100 as dataset_cifar100
@@ -28,6 +30,8 @@ from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, \
     save_checkpoint, FixMatch_Loss, WeightEMA, classifier_warmup
 
 from utils.metrics import get_metrics
+from ConditionalSampling.min_recall import ulb_sample_distribution, lambda_update
+from ConditionalSampling.Dataloader import UnlabeledDataLoader
 
 parser = argparse.ArgumentParser(description='PyTorch FixMatch-CoSSL Training')
 # Optimization options
@@ -37,6 +41,8 @@ parser.add_argument('--batch-size', default=64, type=int, metavar='N',
                     help='train batchsize')
 parser.add_argument('--lr', '--learning-rate', default=0.002, type=float,
                     metavar='LR', help='initial learning rate')
+parser.add_argument('--val_lr', '--validation-learning-rate', default=0.5, type=float,
+                    metavar='VLR', help='initial learning rate')
 parser.add_argument('--lr_tfe', default=0.002, type=float)
 parser.add_argument('--wd_tfe', default=5e-4, type=float)
 parser.add_argument('--warm_tfe', default=10, type=int)
@@ -76,7 +82,6 @@ parser.add_argument('--wandb-entity', default="stablegradients",
 parser.add_argument('--wandb-runid', default="fixmatch-cossl", type=str)
 parser.add_argument('--TFE_warmup', action='store_true')
 
-
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
 
@@ -106,6 +111,7 @@ else:
 
 def main():
     global best_acc
+    num_class = 10 if args.dataset == "cifar10" else 100
     wandb.init(project=args.wandb_project, id=args.wandb_runid, entity=args.wandb_entity)
     if not os.path.isdir(args.out):
         mkdir_p(args.out)
@@ -201,9 +207,11 @@ def main():
 
     # Main function
     test_accs = []
+    
+    lambdas = [float(1.0/num_class) for i in range(num_class)]
     for epoch in range(args.epochs):
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
-
+        print("lambdas....", lambdas)
         # Construct balanced dataset
         class_balanced_disb = torch.Tensor(make_imb_data(30000, num_class, 1))
         class_balanced_disb = class_balanced_disb / class_balanced_disb.sum()
@@ -212,7 +220,8 @@ def main():
         crt_labeled_loader = data.DataLoader(crt_labeled_set, batch_sampler=batch_sampler_x, num_workers=0)
 
         # Evaluation part
-        test_loss, test_acc, *_ = validate_teacher(test_loader, ema_model, ema_teacher, criterion, use_cuda, 'Test', args.dataset)
+        test_loss, test_acc, unlabeled_trainloader, lambdas = validate_teacher(test_loader, ema_model, ema_teacher, criterion, use_cuda, 'Test',\
+                                                   args.dataset, train_unlabeled_set, lambdas, args.val_lr)
 
         # Training part
         *train_info, = train(labeled_trainloader, unlabeled_trainloader, model, ema_model, optimizer, ema_optimizer,
@@ -260,7 +269,6 @@ def train(labeled_trainloader, unlabeled_trainloader, model, ema_model, optimize
 
     bar = Bar('Training', max=args.val_iteration)
     labeled_train_iter = iter(labeled_trainloader)
-    unlabeled_train_iter = iter(unlabeled_trainloader)
     crt_labeled_iter = iter(crt_labeled_loader)
     crt_full_iter = iter(crt_full_loader)
 
@@ -279,10 +287,10 @@ def train(labeled_trainloader, unlabeled_trainloader, model, ema_model, optimize
             inputs_x, targets_x, _ = labeled_train_iter.next()
 
         try:
-            (inputs_u, inputs_u2, inputs_u3), gt_targets_u, idx_u = unlabeled_train_iter.next()
+            (inputs_u, inputs_u2, inputs_u3), gt_targets_u, idx_u = unlabeled_trainloader.next()
         except:
-            unlabeled_train_iter = iter(unlabeled_trainloader)
-            (inputs_u, inputs_u2, inputs_u3), gt_targets_u, idx_u = unlabeled_train_iter.next()
+            inputs_u, gt_targets_u = unlabeled_trainloader.get_batch(targets_x)
+            inputs_u, inputs_u2, inputs_u3 = inputs_u, inputs_u, inputs_u
 
         try:
             crt_input_x, crt_targets_x, _ = crt_labeled_iter.next()
@@ -415,7 +423,8 @@ def train(labeled_trainloader, unlabeled_trainloader, model, ema_model, optimize
     return (losses.avg, losses_x.avg, losses_u.avg, losses_teacher.avg, mask_prob.avg, total_c.avg, used_c.avg, teacher_acc.avg)
 
 
-def validate_teacher(valloader, model, head, criterion, use_cuda, mode, dataset_name):
+def validate_teacher(valloader, model, head, criterion, use_cuda,\
+                     mode, dataset_name, ulb_dataset, lambdas, val_lr):
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -433,6 +442,7 @@ def validate_teacher(valloader, model, head, criterion, use_cuda, mode, dataset_
     classwise_num = torch.zeros(num_class).cuda()
     section_acc = torch.zeros(3).cuda()
     outputs_, targets_ = [], []
+    
     with torch.no_grad():
         for batch_idx, (inputs, targets, _) in enumerate(valloader):
             # measure data loading time
@@ -482,6 +492,7 @@ def validate_teacher(valloader, model, head, criterion, use_cuda, mode, dataset_
                          )
             bar.next()
         bar.finish()
+    
     logits_, labels_ = (np.concatenate(outputs_, axis=0), np.concatenate(targets_, axis=0))
     if dataset_name == "cifar10":
         classes = torchvision.datasets.CIFAR10('./BS/databases00/cifar-10', train=True, download=True).classes
@@ -504,7 +515,16 @@ def validate_teacher(valloader, model, head, criterion, use_cuda, mode, dataset_
         else:
             GM *= (classwise_acc[i]) ** (1/num_class)
 
-    return (losses.avg, top1.avg, section_acc.cpu().numpy(), GM)
+    '''
+    Now we shall generate the conditional data sampler
+    '''
+    recall = recall_score(labels_, logits_, average=None, zero_division=0)
+    new_lambdas = lambda_update(recall, lambdas, val_lr)
+    sampling_distribution = ulb_sample_distribution(CM, new_lambdas)
+    ulb_loader = UnlabeledDataLoader(ulb_dataset, model, head, sampling_distribution, \
+                                     10 if dataset_name == "cifar10" else 100, 1)
+
+    return losses.avg, top1.avg, ulb_loader, new_lambdas
 
 
 if __name__ == '__main__':
